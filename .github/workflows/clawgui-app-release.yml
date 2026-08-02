@@ -1,0 +1,87 @@
+name: clawgui-app release
+
+on:
+  push:
+    tags:
+      - 'clawgui-app-v*'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'why are you triggering this build?'
+        required: false
+        default: 'ad-hoc'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clawgui-app-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clawgui-app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Gradle has its own cache support — cache wrapper + module deps so
+      # subsequent builds drop from ~10 min to ~2 min.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-home-cache-cleanup: true
+
+      # Belt + braces — the git index now stores gradlew as 100755, but if a
+      # future contributor unpacks the repo on Windows the exec bit can get
+      # lost; explicitly restore it before invoking.
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Show toolchain
+        run: |
+          java -version
+          ./gradlew --version
+
+      - name: assembleRelease
+        run: ./gradlew --no-daemon --console=plain assembleRelease
+
+      - name: Locate APK
+        id: apk
+        run: |
+          path=$(find app/build/outputs/apk/release -name '*.apk' | head -n1)
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$path")" >> "$GITHUB_OUTPUT"
+          ls -lh "$path"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clawgui-app-release-apk
+          path: clawgui-app/${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      # Tag pushes get a GitHub Release; ad-hoc workflow_dispatch runs just
+      # leave the APK as an artifact (no release entry).
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/clawgui-app-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: clawgui-app/${{ steps.apk.outputs.path }}
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
