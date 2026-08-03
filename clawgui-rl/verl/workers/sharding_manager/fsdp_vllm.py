@@ -61,7 +61,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         device_mesh: DeviceMesh = None,
         offload_param: bool = False,
         load_format: str = 'dummy_hf',
-        layered_summon: bool = True
+        layered_summon: bool = True,
+        enable_lora_update: bool = True,
     ):
         self.module = module
         # For AsyncLLM, inference_engine and model_runner are defer intialized in vLLMAsyncRollout.load_model
@@ -80,6 +81,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.offload_param = offload_param
         self.load_format = load_format
         self.layered_summon = layered_summon
+        self.enable_lora_update = enable_lora_update
 
         # Full params
         self.full_params = full_params
@@ -112,7 +114,33 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __enter__(self):
-        def __collect_lora_params()->OrderedDict:
+        def __collect_base_params() -> OrderedDict:
+            base_params = OrderedDict()
+            if fsdp_version(self.module) > 0:
+                with FSDP.summon_full_params(self.module, writeback=False):
+                    model = self.module._fsdp_wrapped_module.base_model.model
+                    orig_dev = "cpu" if "cpu" in next(model.parameters()).device.type else "cuda"
+                    model = model.to("cpu")
+                    for name, param in model.state_dict().items():
+                        if any(x in name for x in ["_flat_param", "lora_"]):
+                            continue
+                        name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
+                        base_params[name] = param.full_tensor().detach().cpu() if hasattr(param, "full_tensor") else param.detach().cpu()
+                    model = model.to(orig_dev)
+                torch.cuda.empty_cache()
+            else:
+                model = self.module._fsdp_wrapped_module.base_model.model
+                orig_dev = "cpu" if "cpu" in next(model.parameters()).device.type else "cuda"
+                model = model.to("cpu")
+                for name, param in model.state_dict().items():
+                    if any(x in name for x in ["_flat_param", "lora_"]):
+                        continue
+                    name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
+                    base_params[name] = param.detach().cpu()
+                model = model.to(orig_dev)
+            return base_params
+
+        def __collect_lora_params() -> OrderedDict:
             """
             collect lora params or full params if base model is not ready in vllm
             work with if isinstance(self.module._fsdp_wrapped_module, PeftModel)
@@ -132,29 +160,12 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                             lora_params = {name: param.full_tensor().detach().cpu() if hasattr(param, 'full_tensor') else param.detach().cpu() 
                                         for name, param in lora_params.items()}
                         else:
-                            model = self.module._fsdp_wrapped_module.base_model.model
-                            orig_dev = 'cpu' if 'cpu' in next(model.parameters()).device.type else 'cuda'
-                            model = model.to('cpu')
-                            for name, param in model.state_dict().items():
-                                if any(x in name for x in ['_flat_param', 'lora_']):
-                                    continue
-                                name = name.replace("_fsdp_wrapped_module.","").replace(".base_layer","")
-                                lora_params[name] = param.full_tensor().detach().cpu() if hasattr(param, 'full_tensor') else param.detach().cpu()
-                            model = model.to(orig_dev)
-                    torch.cuda.empty_cache()
+                            lora_params = __collect_base_params()
             else:
                 if self.base_sync_done:
                     lora_params = get_peft_model_state_dict(self.module._fsdp_wrapped_module)
                 else:
-                    model = self.module._fsdp_wrapped_module.base_model.model
-                    orig_dev = 'cpu' if 'cpu' in next(model.parameters()).device.type else 'cuda'
-                    model = model.to('cpu')
-                    for name, param in model.state_dict().items():
-                        if any(x in name for x in ['_flat_param', 'lora_']):
-                            continue
-                        name = name.replace("_fsdp_wrapped_module.","").replace(".base_layer","")
-                        lora_params[name] = param.detach().cpu()
-                    model = model.to(orig_dev)
+                    lora_params = __collect_base_params()
             return lora_params
 
         # NOTE: Basically, we only need `get_torch_device().empty_cache()` before vllm wake_up and
@@ -172,8 +183,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         peft_config = None
         if isinstance(self.module._fsdp_wrapped_module, PeftModel):
-            peft_config = self.module._fsdp_wrapped_module.peft_config.get('default', None)
-            params = __collect_lora_params()
+            if self.enable_lora_update:
+                peft_config = self.module._fsdp_wrapped_module.peft_config.get('default', None)
+                params = __collect_lora_params()
+            elif not self.base_sync_done:
+                params = __collect_base_params()
+            else:
+                params = OrderedDict()
         else:
             params = self.module.state_dict()
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
@@ -195,8 +211,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 self.inference_engine.wake_up()
 
             # update model params
-            self.update_params(params, peft_config=peft_config)
-            log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
+            if params or peft_config:
+                self.update_params(params, peft_config=peft_config)
+                log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
             del params
             if self.offload_param:
                 offload_fsdp_model_to_cpu(self.module)
@@ -274,15 +291,6 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 self.inference_engine.llm_engine.add_lora(lora_reqest)
                 logger.info(f"vLLM load weights, loaded_params: {len(updated_params)}")
                 return
-            else:
-                def replace_lora_wrapper(k):
-                    stacked_params = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
-                    if any([k.endswith(f"{s}.weight") for s in stacked_params]):
-                        return k.replace(".weight", ".base_layer.weight")
-                    if any([k.endswith(f"{s}.bias") for s in stacked_params]):
-                        return k.replace(".bias", ".base_layer.bias")
-                    return k
-                updated_params = {replace_lora_wrapper(k): v for k, v in updated_params.items()}
 
         patch_vllm_moe_model_weight_loader(model)
         device = get_torch_device().current_device()  # used when fsdp2 set cpu_offload_policy

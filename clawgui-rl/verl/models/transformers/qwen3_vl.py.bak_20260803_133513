@@ -27,21 +27,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def qwen3_vl_deepstack_process(
-    self,
-    hidden_states: torch.Tensor,
-    visual_pos_masks: torch.Tensor,
-    visual_embeds: torch.Tensor,
-) -> torch.Tensor:
-    visual_pos_masks = visual_pos_masks.to(hidden_states.device)
-    visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-    # The upstream implementation writes into a view returned by autograd custom
-    # ops during training. Clone first so the indexed update is differentiable.
-    hidden_states = hidden_states.clone()
-    hidden_states[visual_pos_masks, :] = hidden_states[visual_pos_masks, :] + visual_embeds
-    return hidden_states
-
-
 def get_rope_index(
     processor,
     input_ids: torch.Tensor,
